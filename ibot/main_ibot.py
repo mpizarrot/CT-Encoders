@@ -21,11 +21,13 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 
 from pathlib import Path
-from torchvision.transforms import v2
+import torchvision.transforms as T
+from torchvision.ops.misc import Permute
 from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
 from models.head import iBOTHead
-from loader import CTFolderMask
+from loader import CTFolderMask, CTFolderMask3D
+from models.swin3D import swin_3D
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -33,7 +35,7 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--arch', default='vit_base', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large', 'deit_tiny', 'deit_small',
-                 'swin_tiny','swin_small', 'swin_base', 'swin_large'],
+                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'swin3D'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -163,15 +165,27 @@ def train_ibot(args):
         args.local_crops_number,
     )
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
-    dataset = CTFolderMask(
-        args.data_path, 
-        transform=transform,
-        patch_size=pred_size,
-        pred_ratio=args.pred_ratio,
-        pred_ratio_var=args.pred_ratio_var,
-        pred_aspect_ratio=(0.3, 1/0.3),
-        pred_shape=args.pred_shape,
-        pred_start_epoch=args.pred_start_epoch)
+    if args.arch == "swin3D":
+        dataset = CTFolderMask3D(
+            args.data_path, 
+            transform=transform,
+            patch_size=pred_size,
+            pred_ratio=args.pred_ratio,
+            pred_ratio_var=args.pred_ratio_var,
+            pred_aspect_ratio=(0.3, 1/0.3),
+            pred_shape=args.pred_shape,
+            pred_start_epoch=args.pred_start_epoch,
+            batch_size=64)
+    else:
+        dataset = CTFolderMask(
+            args.data_path, 
+            transform=transform,
+            patch_size=pred_size,
+            pred_ratio=args.pred_ratio,
+            pred_ratio_var=args.pred_ratio_var,
+            pred_aspect_ratio=(0.3, 1/0.3),
+            pred_shape=args.pred_shape,
+            pred_start_epoch=args.pred_start_epoch)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -187,7 +201,15 @@ def train_ibot(args):
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
     # if the network is of hierechical features (i.e. swin_tiny, swin_small, swin_base)
-    if args.arch in models.__dict__.keys() and 'swin' in args.arch:
+    if args.arch == "swin3D":
+        student = swin_3D(return_all_tokens=True, 
+            masked_im_modeling=args.use_masked_im_modeling
+        )
+        teacher = swin_3D(return_all_tokens=True
+        )
+        embed_dim = student.num_features
+    
+    elif args.arch in models.__dict__.keys() and 'swin' in args.arch:
         student = models.__dict__[args.arch](
             window_size=args.window_size,
             return_all_tokens=True, 
@@ -564,52 +586,48 @@ class iBOTLoss(nn.Module):
 
 class DataAugmentationiBOT(object):
     def __init__(self, global_crops_scale, local_crops_scale, global_crops_number, local_crops_number):
-        to_grayscale_3ch = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Grayscale(num_output_channels=3),
-        ])
-        flip_and_color_jitter = v2.Compose([
-            v2.RandomHorizontalFlip(p=0.5),
-            v2.RandomApply(
-                [v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+        flip_and_color_jitter = T.Compose([
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomApply(
+                [T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                 p=0.8
             )
         ])
-        normalize = v2.Normalize(mean=[0.0916, 0.0916, 0.0916], std=[0.1002, 0.1002, 0.1002])
+        normalize = T.Normalize(mean=[0.07126], std=[0.13697])
+        permute = Permute([1, 0, 2, 3])
 
         self.global_crops_number = global_crops_number
         # transformation for the first global crop
-        self.global_transfo1 = v2.Compose([
-            to_grayscale_3ch,
-            v2.RandomResizedCrop(224, scale=global_crops_scale, interpolation=3),
+        self.global_transfo1 = T.Compose([
+            T.RandomResizedCrop(224, scale=global_crops_scale, interpolation=3),
             flip_and_color_jitter,
-            v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.)),
+            T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.)),
+            permute,
             normalize,
         ])
         # transformation for the rest of global crops
-        self.global_transfo2 = v2.Compose([
-            to_grayscale_3ch,
-            v2.RandomResizedCrop(224, scale=global_crops_scale, interpolation=3),
+        self.global_transfo2 = T.Compose([
+            T.RandomResizedCrop(224, scale=global_crops_scale, interpolation=3),
             flip_and_color_jitter,
-            v2.RandomApply(
-                [v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.))],
+            T.RandomApply(
+                [T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.))],
                 p=0.1
             ),
-            v2.RandomSolarize(threshold=0.5, p=0.2),
+            T.RandomSolarize(threshold=0.5, p=0.2),
+            permute,
             normalize,
         ])
         # transformation for the local crops
         self.local_crops_number = local_crops_number
-        self.local_transfo = v2.Compose([
-            to_grayscale_3ch,
-            v2.RandomResizedCrop(96, scale=local_crops_scale, interpolation=3),
+        self.local_transfo = T.Compose([
+            T.RandomResizedCrop(96, scale=local_crops_scale, interpolation=3),
             flip_and_color_jitter,
-            v2.RandomApply(
-                [v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.))],
+            T.RandomApply(
+                [T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.))],
                 p=0.5
             ),
-            normalize,
+            permute,
+            normalize
         ])
 
     def __call__(self, image):
