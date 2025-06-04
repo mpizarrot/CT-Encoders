@@ -7,15 +7,187 @@
 import random
 import math
 import numpy as np
-
+from tqdm import tqdm
+import pandas as pd
+import matplotlib.pyplot as plt
 from torchvision.datasets import ImageFolder
 
 import os
 import PIL
 import SimpleITK as sitk
 import torch
+from PIL import Image, ImageOps
 from torchvision.transforms.functional import pil_to_tensor
 from torch.utils.data import Dataset
+
+class HistoricalDocuments(Dataset):
+    def __init__(self, pkl_path,
+                 old_path="/media/chr/Datasets/HORAE/imgs/",
+                 new_path="/home/data/cstears/horae/imgs/",
+                 max_size=224, transform=None):
+        try:
+            self.df = pd.read_pickle(pkl_path)
+        except Exception as e:
+            print(f"No se pudo cargar el archivo pickle: {e}")
+            raise e
+        self.max_size = max_size
+        self.transform = transform
+
+        # Cambiamos el path de las imágenes
+        self.change_path(old_path, new_path)
+        # self.validation()
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        df_idx = self.df.iloc[idx]
+        crop = self.crop_image(df_idx)
+        return self.transform_image(crop)
+
+    def validation(self):
+        for idx in tqdm(range(len(self.df))):
+            df_idx = self.df.iloc[idx]
+
+            x1, y1, x2, y2 = map(int, [df_idx['x1'], df_idx['y1'], df_idx['x2'], df_idx['y2']])
+            if (x2 - x1) > 500 and (y2 - y1) > 500:
+                tqdm.write(f"Se descartó el crop {df_idx['x1']},{df_idx['y1']},{df_idx['x2']},{df_idx['y2']} por ser muy grande")
+                self.df.drop(idx, inplace=True)
+
+    def crop_image(self, df_idx):
+        path_image = df_idx['filename'].iloc[0] if isinstance(df_idx['filename'], pd.Series) else df_idx['filename']
+
+        if not os.path.exists(path_image):
+            raise FileNotFoundError(f"No se encontró el archivo de imagen: {path_image}")
+
+        img = Image.open(path_image).convert('RGB')
+        x1, y1, x2, y2 = map(int, [df_idx['x1'], df_idx['y1'], df_idx['x2'], df_idx['y2']])
+        return img.crop((x1, y1, x2, y2))
+
+    def transform_image(self, image):
+        padded_image = ImageOps.pad(image, size=(self.max_size, self.max_size))
+        return self.transform(padded_image)
+
+    def save_sample(self, original, positive, negative):
+
+        fig, ax = plt.subplots(1, 3)
+        ax[0].imshow(original.permute(1, 2, 0))
+        ax[0].set_title('Original')
+        ax[0].axis('off')
+
+        ax[1].imshow(positive.permute(1, 2, 0))
+        ax[1].set_title('Positive')
+        ax[1].axis('off')
+
+        ax[2].imshow(negative.permute(1, 2, 0))
+        ax[2].set_title('Negative')
+        ax[2].axis('off')
+
+        plt.show()
+
+    def change_path(self, old_path, new_path):
+        self.df['filename'] = self.df['filename'].apply(lambda x: x.replace(old_path, new_path))
+
+class HistoricalDocFolderMask(HistoricalDocuments):
+    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio,
+                 pred_shape='block', pred_start_epoch=0, **kwargs):
+        super(HistoricalDocFolderMask, self).__init__(*args, **kwargs)
+        self.psz = patch_size
+        self.pred_ratio = pred_ratio[0] if isinstance(pred_ratio, list) and \
+            len(pred_ratio) == 1 else pred_ratio
+        self.pred_ratio_var = pred_ratio_var[0] if isinstance(pred_ratio_var, list) and \
+            len(pred_ratio_var) == 1 else pred_ratio_var
+        if isinstance(self.pred_ratio, list) and not isinstance(self.pred_ratio_var, list):
+            self.pred_ratio_var = [self.pred_ratio_var] * len(self.pred_ratio)
+        self.log_aspect_ratio = tuple(map(lambda x: math.log(x), pred_aspect_ratio))
+        self.pred_shape = pred_shape
+        self.pred_start_epoch = pred_start_epoch
+
+    def get_pred_ratio(self):
+        if hasattr(self, 'epoch') and self.epoch < self.pred_start_epoch:
+            return 0
+
+        if isinstance(self.pred_ratio, list):
+            pred_ratio = []
+            for prm, prv in zip(self.pred_ratio, self.pred_ratio_var):
+                assert prm >= prv
+                pr = random.uniform(prm - prv, prm + prv) if prv > 0 else prm
+                pred_ratio.append(pr)
+            pred_ratio = random.choice(pred_ratio)
+        else:
+            assert self.pred_ratio >= self.pred_ratio_var
+            pred_ratio = random.uniform(self.pred_ratio - self.pred_ratio_var, self.pred_ratio + \
+                self.pred_ratio_var) if self.pred_ratio_var > 0 else self.pred_ratio
+
+        return pred_ratio
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __getitem__(self, index):
+        output = super(HistoricalDocFolderMask, self).__getitem__(index)
+
+        masks = []
+        for img in output:
+            try:
+                H, W = img.shape[1] // self.psz, img.shape[2] // self.psz
+            except:
+                # skip non-image
+                continue
+
+            high = self.get_pred_ratio() * H * W
+
+            if self.pred_shape == 'block':
+                # following BEiT (https://arxiv.org/abs/2106.08254), see at
+                # https://github.com/microsoft/unilm/blob/b94ec76c36f02fb2b0bf0dcb0b8554a2185173cd/beit/masking_generator.py#L55
+                mask = np.zeros((H, W), dtype=bool)
+                mask_count = 0
+                while mask_count < high:
+                    max_mask_patches = high - mask_count
+
+                    delta = 0
+                    for attempt in range(10):
+                        low = (min(H, W) // 3) ** 2
+                        target_area = random.uniform(low, max_mask_patches)
+                        aspect_ratio = math.exp(random.uniform(*self.log_aspect_ratio))
+                        h = int(round(math.sqrt(target_area * aspect_ratio)))
+                        w = int(round(math.sqrt(target_area / aspect_ratio)))
+                        if w < W and h < H:
+                            top = random.randint(0, H - h)
+                            left = random.randint(0, W - w)
+
+                            num_masked = mask[top: top + h, left: left + w].sum()
+                            if 0 < h * w - num_masked <= max_mask_patches:
+                                for i in range(top, top + h):
+                                    for j in range(left, left + w):
+                                        if mask[i, j] == 0:
+                                            mask[i, j] = 1
+                                            delta += 1
+
+                        if delta > 0:
+                            break
+
+                    if delta == 0:
+                        break
+                    else:
+                        mask_count += delta
+
+            elif self.pred_shape == 'rand':
+                mask = np.hstack([
+                    np.zeros(H * W - int(high)),
+                    np.ones(int(high)),
+                ]).astype(bool)
+                np.random.shuffle(mask)
+                mask = mask.reshape(H, W)
+
+            else:
+                # no implementation
+                assert False
+
+            masks.append(mask)
+
+        return (output, masks)
+
 
 class CTDataset(Dataset):
     def __init__(self, image_folder, transform=None):
@@ -33,9 +205,9 @@ class CTDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image
-    
+
 class CTFolderMask(CTDataset):
-    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio, 
+    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio,
                  pred_shape='block', pred_start_epoch=0, **kwargs):
         super(CTFolderMask, self).__init__(*args, **kwargs)
         self.psz = patch_size
@@ -64,7 +236,7 @@ class CTFolderMask(CTDataset):
             assert self.pred_ratio >= self.pred_ratio_var
             pred_ratio = random.uniform(self.pred_ratio - self.pred_ratio_var, self.pred_ratio + \
                 self.pred_ratio_var) if self.pred_ratio_var > 0 else self.pred_ratio
-        
+
         return pred_ratio
 
     def set_epoch(self, epoch):
@@ -72,7 +244,7 @@ class CTFolderMask(CTDataset):
 
     def __getitem__(self, index):
         output = super(CTFolderMask, self).__getitem__(index)
-                
+
         masks = []
         for img in output:
             try:
@@ -80,9 +252,9 @@ class CTFolderMask(CTDataset):
             except:
                 # skip non-image
                 continue
-            
+
             high = self.get_pred_ratio() * H * W
-            
+
             if self.pred_shape == 'block':
                 # following BEiT (https://arxiv.org/abs/2106.08254), see at
                 # https://github.com/microsoft/unilm/blob/b94ec76c36f02fb2b0bf0dcb0b8554a2185173cd/beit/masking_generator.py#L55
@@ -93,7 +265,7 @@ class CTFolderMask(CTDataset):
 
                     delta = 0
                     for attempt in range(10):
-                        low = (min(H, W) // 3) ** 2 
+                        low = (min(H, W) // 3) ** 2
                         target_area = random.uniform(low, max_mask_patches)
                         aspect_ratio = math.exp(random.uniform(*self.log_aspect_ratio))
                         h = int(round(math.sqrt(target_area * aspect_ratio)))
@@ -117,7 +289,7 @@ class CTFolderMask(CTDataset):
                         break
                     else:
                         mask_count += delta
-            
+
             elif self.pred_shape == 'rand':
                 mask = np.hstack([
                     np.zeros(H * W - int(high)),
@@ -133,14 +305,14 @@ class CTFolderMask(CTDataset):
             masks.append(mask)
 
         return (output, masks)
-    
+
 class CTDataset3D(Dataset):
     def __init__(self, image_folder, transform=None, batch_size=None):
         self.image_folder = image_folder
         self.transform = transform
         self.image_files = [f for f in os.listdir(image_folder) if f.endswith(('.nii', '.nii.gz'))]
         self.batch_size = batch_size
-        
+
     def __len__(self):
         return len(self.image_files)
 
@@ -155,23 +327,23 @@ class CTDataset3D(Dataset):
         if self.transform:
             image = self.transform(image)
         return image
-    
+
     def process_img(self, img):
         D, _, _ = img.shape
         while D != self.batch_size:
             if D < self.batch_size:
                 padding_needed = self.batch_size - D
                 img = np.pad(img, ((0, padding_needed), (0, 0), (0, 0)), mode='constant')
-            elif D > 250:
+            elif D > 250 and self.batch_size < 125:
                 img = img[::2, :, :]
             else:
                 crop_size = (D - self.batch_size) // 2
                 img = img[crop_size:-crop_size, :, :]
             D, _, _ = img.shape
         return img
-    
+
 class CTFolderMask3D(CTDataset3D):
-    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio, 
+    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio,
                  pred_shape='block', pred_start_epoch=0, **kwargs):
         super(CTFolderMask3D, self).__init__(*args, **kwargs)
         self.psz = patch_size
@@ -200,7 +372,7 @@ class CTFolderMask3D(CTDataset3D):
             assert self.pred_ratio >= self.pred_ratio_var
             pred_ratio = random.uniform(self.pred_ratio - self.pred_ratio_var, self.pred_ratio + \
                 self.pred_ratio_var) if self.pred_ratio_var > 0 else self.pred_ratio
-        
+
         return pred_ratio
 
     def set_epoch(self, epoch):
@@ -208,7 +380,7 @@ class CTFolderMask3D(CTDataset3D):
 
     def __getitem__(self, index):
         output = super(CTFolderMask3D, self).__getitem__(index)
-                
+
         masks = []
         for img in output:
             try:
@@ -216,9 +388,9 @@ class CTFolderMask3D(CTDataset3D):
             except:
                 # skip non-image
                 continue
-            
+
             high = self.get_pred_ratio() * H * W
-            
+
             if self.pred_shape == 'block':
                 # following BEiT (https://arxiv.org/abs/2106.08254), see at
                 # https://github.com/microsoft/unilm/blob/b94ec76c36f02fb2b0bf0dcb0b8554a2185173cd/beit/masking_generator.py#L55
@@ -253,7 +425,7 @@ class CTFolderMask3D(CTDataset3D):
                         break
                     else:
                         mask_count += delta
-            
+
             elif self.pred_shape == 'rand':
                 mask = np.hstack([
                     np.zeros(H * W - int(high)),
@@ -276,7 +448,7 @@ class ImageFolderInstance(ImageFolder):
         return img, target, index
 
 class ImageFolderMask(ImageFolder):
-    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio, 
+    def __init__(self, *args, patch_size, pred_ratio, pred_ratio_var, pred_aspect_ratio,
                  pred_shape='block', pred_start_epoch=0, **kwargs):
         super(ImageFolderMask, self).__init__(*args, **kwargs)
         self.psz = patch_size
@@ -305,7 +477,7 @@ class ImageFolderMask(ImageFolder):
             assert self.pred_ratio >= self.pred_ratio_var
             pred_ratio = random.uniform(self.pred_ratio - self.pred_ratio_var, self.pred_ratio + \
                 self.pred_ratio_var) if self.pred_ratio_var > 0 else self.pred_ratio
-        
+
         return pred_ratio
 
     def set_epoch(self, epoch):
@@ -313,7 +485,7 @@ class ImageFolderMask(ImageFolder):
 
     def __getitem__(self, index):
         output = super(ImageFolderMask, self).__getitem__(index)
-                
+
         masks = []
         for img in output[0]:
             try:
@@ -321,9 +493,9 @@ class ImageFolderMask(ImageFolder):
             except:
                 # skip non-image
                 continue
-            
+
             high = self.get_pred_ratio() * H * W
-            
+
             if self.pred_shape == 'block':
                 # following BEiT (https://arxiv.org/abs/2106.08254), see at
                 # https://github.com/microsoft/unilm/blob/b94ec76c36f02fb2b0bf0dcb0b8554a2185173cd/beit/masking_generator.py#L55
@@ -334,7 +506,7 @@ class ImageFolderMask(ImageFolder):
 
                     delta = 0
                     for attempt in range(10):
-                        low = (min(H, W) // 3) ** 2 
+                        low = (min(H, W) // 3) ** 2
                         target_area = random.uniform(low, max_mask_patches)
                         aspect_ratio = math.exp(random.uniform(*self.log_aspect_ratio))
                         h = int(round(math.sqrt(target_area * aspect_ratio)))
@@ -358,7 +530,7 @@ class ImageFolderMask(ImageFolder):
                         break
                     else:
                         mask_count += delta
-            
+
             elif self.pred_shape == 'rand':
                 mask = np.hstack([
                     np.zeros(H * W - int(high)),

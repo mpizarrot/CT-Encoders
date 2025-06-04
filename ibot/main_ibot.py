@@ -26,8 +26,9 @@ from torchvision.ops.misc import Permute
 from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
 from models.head import iBOTHead
-from loader import CTFolderMask, CTFolderMask3D
+from loader import CTFolderMask, CTFolderMask3D, HistoricalDocFolderMask
 from models.swin3D import swin_3D
+from models.vit_lora import vit_lora
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -35,7 +36,7 @@ def get_args_parser():
     # Model parameters
     parser.add_argument('--arch', default='vit_base', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'vit_large', 'deit_tiny', 'deit_small',
-                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'swin3D'],
+                 'swin_tiny','swin_small', 'swin_base', 'swin_large', 'swin3D', 'vit_lora'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -90,7 +91,7 @@ def get_args_parser():
         `--warmup_teacher_temp`""")
     parser.add_argument('--teacher_patch_temp', default=0.07, type=float, help=""""See 
         `--teacher_temp`""")
-    parser.add_argument('--warmup_teacher_temp_epochs', default=50, type=int,
+    parser.add_argument('--warmup_teacher_temp_epochs', default=30, type=int,
         help='Number of warmup epochs for the teacher temperature (Default: 30).')
 
     # Training/Optimization parameters
@@ -142,12 +143,14 @@ def get_args_parser():
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=50, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--saveckp_freq', default=40, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+    parser.add_argument('--ckpt_path_student', default="/home/mpizarro/data/ibot_pretrained_student.pth", type=str)
+    parser.add_argument('--ckpt_path_teacher', default="/home/mpizarro/data/ibot_pretrained_teacher.pth", type=str)
     return parser
 
 def train_ibot(args):
@@ -175,7 +178,17 @@ def train_ibot(args):
             pred_aspect_ratio=(0.3, 1/0.3),
             pred_shape=args.pred_shape,
             pred_start_epoch=args.pred_start_epoch,
-            batch_size=64)
+            batch_size=224)
+    elif args.data_path.endswith(".pkl"):
+        dataset = HistoricalDocFolderMask(
+            pkl_path=args.data_path,
+            transform=transform,
+            patch_size=pred_size,
+            pred_ratio=args.pred_ratio,
+            pred_ratio_var=args.pred_ratio_var,
+            pred_aspect_ratio=(0.3, 1/0.3),
+            pred_shape=args.pred_shape,
+            pred_start_epoch=args.pred_start_epoch)
     else:
         dataset = CTFolderMask(
             args.data_path, 
@@ -201,7 +214,21 @@ def train_ibot(args):
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
     # if the network is of hierechical features (i.e. swin_tiny, swin_small, swin_base)
-    if args.arch == "swin3D":
+    if args.arch == "vit_lora":
+        student = vit_lora(
+            ckpt_path=args.ckpt_path_student,
+            patch_size=args.patch_size,
+            drop_path_rate=args.drop_path,
+            return_all_tokens=True,
+            masked_im_modeling=args.use_masked_im_modeling,
+        )
+        teacher = vit_lora(
+            ckpt_path=args.ckpt_path_teacher,
+            patch_size=args.patch_size,
+            return_all_tokens=True,
+        )
+        embed_dim = student.embed_dim
+    elif args.arch == "swin3D":
         student = swin_3D(return_all_tokens=True, 
             masked_im_modeling=args.use_masked_im_modeling
         )
@@ -554,7 +581,7 @@ class iBOTLoss(nn.Module):
             for v in range(len(student_cls_c)):
                 if v == q:
                     loss2 = torch.sum(-teacher_patch_c[q] * F.log_softmax(student_patch_c[v], dim=-1), dim=-1)
-                    mask = student_mask[v].flatten(-2, -1)
+                    mask = student_mask[v].flatten(1)
                     loss2 = torch.sum(loss2 * mask.float(), dim=-1) / mask.sum(dim=-1).clamp(min=1.0)
                     total_loss2 += loss2.mean()
                     n_loss_terms2 += 1
@@ -592,9 +619,15 @@ class DataAugmentationiBOT(object):
                 [T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                 p=0.8
             )
+            # ),
+            # T.RandomGrayscale(p=0.2),
         ])
         normalize = T.Normalize(mean=[0.07126], std=[0.13697])
         permute = Permute([1, 0, 2, 3])
+        # normalize = T.Compose([
+        #     T.ToTensor(),
+        #     T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        # ])
 
         self.global_crops_number = global_crops_number
         # transformation for the first global crop

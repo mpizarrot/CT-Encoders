@@ -687,6 +687,13 @@ class SwinTransformer(nn.Module):
         self.patch_norm = patch_norm
         self.window_size = window_size
         self.patch_size = patch_size
+        # self.patch_embed = PatchEmbed(
+        #     patch_size=(1, 1, 1),
+        #     in_chans=in_chans,
+        #     embed_dim=embed_dim,
+        #     norm_layer=norm_layer if self.patch_norm else None,  # type: ignore
+        #     spatial_dims=spatial_dims,
+        # )
         self.patch_embed = PatchEmbed(
             patch_size=self.patch_size,
             in_chans=in_chans,
@@ -719,7 +726,7 @@ class SwinTransformer(nn.Module):
                 drop=drop_rate,
                 attn_drop=attn_drop_rate,
                 norm_layer=norm_layer,
-                downsample=down_sample_mod,
+                downsample=down_sample_mod if (i_layer < self.num_layers - 1) else None,
                 use_checkpoint=use_checkpoint,
             )
             if i_layer == 0:
@@ -749,7 +756,7 @@ class SwinTransformer(nn.Module):
                 elif i_layer == 3:
                     self.layers4c.append(layerc)
                     
-        self.num_features = int(embed_dim * 2 ** (self.num_layers))
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.return_all_tokens = return_all_tokens
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
@@ -776,6 +783,8 @@ class SwinTransformer(nn.Module):
 
     def forward(self, x, normalize=True, return_all_tokens=None, mask=None):
         x0 = self.patch_embed(x)
+        # x_out = self.proj_out(x, normalize)
+        # x0 = self.patch_embed1(x_out)
         # mask image modeling
         if mask is not None:
             x0 = self.mask_model(x0, mask)
@@ -828,7 +837,7 @@ def swin_3D(window_size=(7, 7, 7), **kwargs):
             in_chans=1,
             embed_dim=48,
             window_size=window_size,
-            patch_size=(2, 2, 2),
+            patch_size=(4, 4, 4),
             depths=[2, 2, 2, 2],
             num_heads=[3, 6, 12, 24],
             mlp_ratio=4.0,
